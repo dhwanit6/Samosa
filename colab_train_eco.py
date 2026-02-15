@@ -24,11 +24,30 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(line_buffering=True)
 
-# Allow importing from train/ root.
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Allow importing both as:
+# 1) package module: python -m diffusion.colab_train_eco
+# 2) top-level module/script: python -m colab_train_eco / python colab_train_eco.py
+_THIS_DIR = Path(__file__).resolve().parent
+for _p in (_THIS_DIR, _THIS_DIR.parent):
+    _s = str(_p)
+    if _s not in sys.path:
+        sys.path.insert(0, _s)
 
-from diffusion.train_eco_hybrid import train as train_eco  # noqa: E402
-from runners.colab_train import _resolve_path, prepare_data, setup_environment  # noqa: E402
+try:
+    from diffusion.train_eco_hybrid import train as train_eco  # noqa: E402
+except ModuleNotFoundError:
+    from train_eco_hybrid import train as train_eco  # type: ignore # noqa: E402
+
+try:
+    from runners.colab_train import _resolve_path, prepare_data, setup_environment  # noqa: E402
+except ModuleNotFoundError:
+    try:
+        from colab_train import _resolve_path, prepare_data, setup_environment  # type: ignore # noqa: E402
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Could not import data setup helpers. Expected either "
+            "`runners/colab_train.py` or `colab_train.py` in your repo."
+        ) from exc
 
 
 def main():

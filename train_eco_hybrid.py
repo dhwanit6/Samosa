@@ -94,6 +94,14 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model._orig_mod if hasattr(model, "_orig_mod") else model
 
 
+def _normalize_state_dict_keys(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    if not state_dict:
+        return state_dict
+    if all(key.startswith("_orig_mod.") for key in state_dict.keys()):
+        return {key[len("_orig_mod.") :]: value for key, value in state_dict.items()}
+    return state_dict
+
+
 def _apply_edge_profile(args: argparse.Namespace) -> None:
     if args.edge_profile == "none":
         return
@@ -206,6 +214,25 @@ def train(args: argparse.Namespace):
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    start_step = 0
+
+    resume_path: Path | None = None
+    if args.resume:
+        resume_path = Path(args.resume)
+    elif args.resume_latest:
+        candidate = out_dir / "latest.pt"
+        if candidate.exists():
+            resume_path = candidate
+
+    if resume_path is not None:
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        ckpt = torch.load(str(resume_path), map_location=device, weights_only=False)
+        raw_model.load_state_dict(_normalize_state_dict_keys(ckpt["model"]))
+        if (not args.reset_optimizer) and ("optimizer" in ckpt):
+            optimizer.load_state_dict(ckpt["optimizer"])
+        start_step = int(ckpt.get("step", -1)) + 1
+        print(f"[resume] loaded {resume_path} at step {start_step}")
 
     print("=" * 70)
     print("EcoHybrid Diffusion LM Training")
@@ -235,7 +262,7 @@ def train(args: argparse.Namespace):
     running_mask = 0.0
     t0 = time.time()
 
-    for step in range(args.max_steps):
+    for step in range(start_step, args.max_steps):
         step_loss = 0.0
         step_mask = 0.0
         for _ in range(args.grad_accum):
@@ -359,6 +386,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--compile", action="store_true")
+    p.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume from")
+    p.add_argument("--resume_latest", action="store_true", help="Resume from output_dir/latest.pt if present")
+    p.add_argument("--reset_optimizer", action="store_true", help="Ignore optimizer state when resuming")
     p.add_argument("--no_amp", action="store_true", help="Disable CUDA AMP")
     p.add_argument(
         "--amp_dtype",

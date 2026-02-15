@@ -1,0 +1,35 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local experiment artifacts
+checkpoints/
+tmp_*/
+tmp*/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Data artifacts (generated/downloaded locally)
+data/raw/
+data/processed/
+data/tokenizer/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

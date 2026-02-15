@@ -205,6 +205,14 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--no_amp", action="store_true", help="Disable CUDA AMP")
+    parser.add_argument(
+        "--amp_dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp16"],
+        help="AMP dtype when CUDA AMP is enabled",
+    )
 
     # Model controls
     parser.add_argument("--d_model", type=int, default=512)
@@ -214,6 +222,13 @@ def main():
     parser.add_argument("--memory_slots", type=int, default=16)
     parser.add_argument("--conv_kernel", type=int, default=7)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--edge_profile",
+        type=str,
+        default="none",
+        choices=["none", "tiny", "laptop"],
+        help="Apply edge-optimized model presets",
+    )
 
     # Diffusion controls
     parser.add_argument("--timesteps", type=int, default=32)

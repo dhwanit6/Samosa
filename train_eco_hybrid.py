@@ -18,6 +18,7 @@ import math
 import os
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -93,6 +94,28 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model._orig_mod if hasattr(model, "_orig_mod") else model
 
 
+def _apply_edge_profile(args: argparse.Namespace) -> None:
+    if args.edge_profile == "none":
+        return
+    if args.edge_profile == "tiny":
+        args.d_model = 256
+        args.n_layers = 6
+        args.n_heads = 4
+        args.d_ff = 768
+        args.memory_slots = min(args.memory_slots, 8)
+        args.timesteps = 16
+        args.sample_steps = 8
+        args.seq_len = min(args.seq_len, 384)
+    elif args.edge_profile == "laptop":
+        args.d_model = 320
+        args.n_layers = 8
+        args.n_heads = 8
+        args.d_ff = 960
+        args.memory_slots = min(args.memory_slots, 12)
+        args.timesteps = 24
+        args.sample_steps = 10
+
+
 def load_vocab_size(data_dir: Path) -> int:
     meta_path = data_dir / "meta.json"
     if not meta_path.exists():
@@ -104,6 +127,7 @@ def load_vocab_size(data_dir: Path) -> int:
 
 
 def train(args: argparse.Namespace):
+    _apply_edge_profile(args)
     data_dir = Path(args.data_dir)
     train_bin = data_dir / "train.bin"
     if not train_bin.exists():
@@ -139,6 +163,10 @@ def train(args: argparse.Namespace):
     if args.compile and hasattr(torch, "compile"):
         model = torch.compile(model)
     raw_model = _unwrap_model(model)
+    use_amp = device.type == "cuda" and not args.no_amp
+    use_bf16 = use_amp and args.amp_dtype == "bf16" and torch.cuda.is_bf16_supported()
+    amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp and not use_bf16)
 
     ds = BinaryTokenDataset(str(train_bin), seq_len=args.seq_len)
     if len(ds) == 0:
@@ -194,6 +222,10 @@ def train(args: argparse.Namespace):
         f"Time mode: {cfg.time_mode} ({cfg.timestep_sampling}) | "
         f"Masking: {cfg.masking_strategy} (mean_span={cfg.mean_span_length})"
     )
+    if use_amp:
+        print(f"AMP: enabled ({'bf16' if use_bf16 else 'fp16'})")
+    else:
+        print("AMP: disabled")
     print("=" * 70)
 
     model.train()
@@ -214,13 +246,28 @@ def train(args: argparse.Namespace):
                 batch = next(iterator)
 
             x = batch["input_ids"].to(device, non_blocking=True)
-            loss, masked_ratio = model.compute_loss(x)
-            (loss / args.grad_accum).backward()
+            autocast_ctx = (
+                torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp)
+                if use_amp
+                else nullcontext()
+            )
+            with autocast_ctx:
+                loss, masked_ratio = model.compute_loss(x)
+            if scaler.is_enabled():
+                scaler.scale(loss / args.grad_accum).backward()
+            else:
+                (loss / args.grad_accum).backward()
             step_loss += float(loss.item())
             step_mask += masked_ratio
 
+        if scaler.is_enabled():
+            scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        if scaler.is_enabled():
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
         running_loss += step_loss / args.grad_accum
@@ -275,6 +322,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--memory_slots", type=int, default=16)
     p.add_argument("--conv_kernel", type=int, default=7)
     p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument(
+        "--edge_profile",
+        type=str,
+        default="none",
+        choices=["none", "tiny", "laptop"],
+        help="Apply edge-optimized model presets",
+    )
 
     p.add_argument("--timesteps", type=int, default=32)
     p.add_argument("--sample_steps", type=int, default=12)
@@ -305,6 +359,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--compile", action="store_true")
+    p.add_argument("--no_amp", action="store_true", help="Disable CUDA AMP")
+    p.add_argument(
+        "--amp_dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp16"],
+        help="AMP dtype when CUDA AMP is enabled",
+    )
     return p.parse_args()
 
 

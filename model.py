@@ -359,6 +359,8 @@ class DiffusionLanguageModel(nn.Module):
         eos_token_id: int | None = None,
         blockwise: bool = False,
         block_size: int | None = None,
+        calibrated_confidence: bool = True,
+        final_fill_threshold: int = 16,
     ) -> torch.Tensor:
         """
         Confidence-based iterative unmasking (MaskGIT-style).
@@ -404,6 +406,8 @@ class DiffusionLanguageModel(nn.Module):
                     temperature=temperature,
                     top_k=top_k,
                     temperature_end=temperature_end,
+                    calibrated_confidence=calibrated_confidence,
+                    final_fill_threshold=final_fill_threshold,
                 )
                 new_tokens = tokens[:, -chunk:]
                 generated = torch.cat([generated, new_tokens], dim=1)
@@ -437,6 +441,8 @@ class DiffusionLanguageModel(nn.Module):
             temperature=temperature,
             top_k=top_k,
             temperature_end=temperature_end,
+            calibrated_confidence=calibrated_confidence,
+            final_fill_threshold=final_fill_threshold,
         )
         continuation = tokens[:, prompt_len:]
         if eos_token_id is not None:
@@ -454,6 +460,8 @@ class DiffusionLanguageModel(nn.Module):
         temperature: float,
         top_k: int,
         temperature_end: float | None,
+        calibrated_confidence: bool,
+        final_fill_threshold: int,
     ) -> torch.Tensor:
         bsz, total_len = tokens.shape
         for s in range(steps - 1, -1, -1):
@@ -474,8 +482,12 @@ class DiffusionLanguageModel(nn.Module):
                 temperature_end=temperature_end,
             )
             if step_temp <= 0:
-                probs = F.softmax(logits.float(), dim=-1)
-                conf, pred = probs.max(dim=-1)
+                pred = logits.argmax(dim=-1)
+                if calibrated_confidence:
+                    probs = F.softmax(logits.float(), dim=-1)
+                    conf = probs.gather(-1, pred.unsqueeze(-1)).squeeze(-1)
+                else:
+                    conf = logits.float().amax(dim=-1)
             else:
                 scaled = logits / step_temp
                 if top_k > 0:
@@ -510,6 +522,22 @@ class DiffusionLanguageModel(nn.Module):
                     best = vals.topk(min(n_reveal, n_rem), dim=0).indices
                     choose = idx[best]
                 tokens[b, choose] = pred[b, choose]
+                remain = tokens[b].eq(self.config.mask_token_id) & (~fixed[b])
+                if not remain.any():
+                    continue
+
+                # Fast path for edge devices: finish tiny remainder immediately.
+                if final_fill_threshold > 0 and int(remain.sum().item()) <= final_fill_threshold:
+                    tokens[b, remain] = pred[b, remain]
+                    continue
+
+                # Confidence-gated early finalize (requires calibrated probabilities).
+                if (
+                    calibrated_confidence
+                    and self.config.confidence_stop > 0.0
+                    and conf[b, remain].mean().item() >= self.config.confidence_stop
+                ):
+                    tokens[b, remain] = pred[b, remain]
 
         # Fallback in case some mask tokens remain.
         remaining = tokens.eq(self.config.mask_token_id) & (~fixed)

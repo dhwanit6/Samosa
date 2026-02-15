@@ -31,6 +31,7 @@ class DiffusionLMConfig:
     # Sampling
     sample_steps: int = 16
     block_size: int = 64
+    confidence_stop: float = 0.98
 
     # Initialization
     init_std: float = 0.02
@@ -56,3 +57,5 @@ class DiffusionLMConfig:
             raise ValueError("mean_span_length must be > 0")
         if self.block_size < 1:
             raise ValueError("block_size must be >= 1")
+        if not (0.0 <= self.confidence_stop < 1.0):
+            raise ValueError("confidence_stop must be in [0, 1)")

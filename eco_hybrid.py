@@ -68,8 +68,8 @@ class EcoHybridConfig:
             raise ValueError("conv_kernel_size must be odd and >= 3")
         if not (0.0 <= self.min_mask_rate < self.max_mask_rate <= 1.0):
             raise ValueError("mask rates must satisfy 0 <= min < max <= 1")
-        if not (0.0 < self.confidence_stop < 1.0):
-            raise ValueError("confidence_stop must be in (0, 1)")
+        if not (0.0 <= self.confidence_stop < 1.0):
+            raise ValueError("confidence_stop must be in [0, 1)")
         if self.time_mode not in {"discrete", "continuous"}:
             raise ValueError("time_mode must be one of: discrete, continuous")
         if self.timestep_sampling not in {"uniform", "stratified"}:
@@ -408,6 +408,8 @@ class EcoHybridDiffusionLM(nn.Module):
         eos_token_id: int | None = None,
         blockwise: bool = False,
         block_size: int | None = None,
+        calibrated_confidence: bool = True,
+        final_fill_threshold: int = 16,
     ) -> torch.Tensor:
         self.eval()
         steps = max(2, num_steps or self.cfg.sample_steps)
@@ -445,6 +447,8 @@ class EcoHybridDiffusionLM(nn.Module):
                     temperature=temperature,
                     top_k=top_k,
                     temperature_end=temperature_end,
+                    calibrated_confidence=calibrated_confidence,
+                    final_fill_threshold=final_fill_threshold,
                 )
                 new_tokens = tokens[:, -chunk:]
                 generated = torch.cat([generated, new_tokens], dim=1)
@@ -478,6 +482,8 @@ class EcoHybridDiffusionLM(nn.Module):
             temperature=temperature,
             top_k=top_k,
             temperature_end=temperature_end,
+            calibrated_confidence=calibrated_confidence,
+            final_fill_threshold=final_fill_threshold,
         )
         continuation = tokens[:, prompt_len:]
         if eos_token_id is not None:
@@ -495,6 +501,8 @@ class EcoHybridDiffusionLM(nn.Module):
         temperature: float,
         top_k: int,
         temperature_end: float | None,
+        calibrated_confidence: bool,
+        final_fill_threshold: int,
     ) -> torch.Tensor:
         bsz, total_len = tokens.shape
         for s in range(steps - 1, -1, -1):
@@ -514,8 +522,12 @@ class EcoHybridDiffusionLM(nn.Module):
                 temperature_end=temperature_end,
             )
             if step_temp <= 0:
-                probs = F.softmax(logits.float(), dim=-1)
-                conf, pred = probs.max(dim=-1)
+                pred = logits.argmax(dim=-1)
+                if calibrated_confidence:
+                    probs = F.softmax(logits.float(), dim=-1)
+                    conf = probs.gather(-1, pred.unsqueeze(-1)).squeeze(-1)
+                else:
+                    conf = logits.float().amax(dim=-1)
             else:
                 scaled = logits / step_temp
                 if top_k > 0:
@@ -553,7 +565,18 @@ class EcoHybridDiffusionLM(nn.Module):
                 tokens[b, choose] = pred[b, choose]
 
                 remain = tokens[b].eq(self.cfg.mask_token_id) & (~fixed[b])
-                if remain.any() and conf[b, remain].mean().item() >= self.cfg.confidence_stop:
+                if not remain.any():
+                    continue
+
+                if final_fill_threshold > 0 and int(remain.sum().item()) <= final_fill_threshold:
+                    tokens[b, remain] = pred[b, remain]
+                    continue
+
+                if (
+                    calibrated_confidence
+                    and self.cfg.confidence_stop > 0.0
+                    and conf[b, remain].mean().item() >= self.cfg.confidence_stop
+                ):
                     tokens[b, remain] = pred[b, remain]
 
         remaining = tokens.eq(self.cfg.mask_token_id) & (~fixed)

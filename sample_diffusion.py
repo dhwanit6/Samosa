@@ -4,13 +4,27 @@ Sample text from a trained diffusion language model checkpoint.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import sentencepiece as spm
 import torch
 
-from diffusion.config import DiffusionLMConfig
-from diffusion.model import DiffusionLanguageModel
+# Support multiple repo layouts and invocation styles:
+# - python -m diffusion.sample_diffusion
+# - python -m sample_diffusion
+_THIS_DIR = Path(__file__).resolve().parent
+for _p in (_THIS_DIR, _THIS_DIR.parent, _THIS_DIR / "train"):
+    _s = str(_p)
+    if _s not in sys.path:
+        sys.path.insert(0, _s)
+
+try:
+    from diffusion.config import DiffusionLMConfig
+    from diffusion.model import DiffusionLanguageModel
+except ModuleNotFoundError:
+    from config import DiffusionLMConfig  # type: ignore
+    from model import DiffusionLanguageModel  # type: ignore
 
 
 def _normalize_state_dict_keys(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -21,13 +35,45 @@ def _normalize_state_dict_keys(state_dict: dict[str, torch.Tensor]) -> dict[str,
     return state_dict
 
 
-def load_model(ckpt_path: Path, device: torch.device) -> DiffusionLanguageModel:
+def load_model(
+    ckpt_path: Path, device: torch.device, quantize_dynamic: bool = False
+) -> DiffusionLanguageModel:
     ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
     config = DiffusionLMConfig(**ckpt["config"])
     model = DiffusionLanguageModel(config).to(device)
     model.load_state_dict(_normalize_state_dict_keys(ckpt["model"]))
+    if quantize_dynamic:
+        if device.type != "cpu":
+            print("[WARN] Dynamic quantization is CPU-only. Ignoring --quantize_dynamic on non-CPU device.")
+        else:
+            model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
     model.eval()
     return model
+
+
+def _apply_edge_profile(args: argparse.Namespace) -> None:
+    if args.edge_profile == "none":
+        return
+    if args.edge_profile == "balanced":
+        args.steps = min(args.steps, 8)
+        args.temperature = min(args.temperature, 0.8)
+        if args.temperature_end is None:
+            args.temperature_end = 0.6
+        args.top_k = 0
+        args.blockwise = True
+        args.block_size = args.block_size or 64
+        args.calibrated_confidence = False
+        args.final_fill_threshold = max(args.final_fill_threshold, 16)
+    elif args.edge_profile == "max":
+        args.steps = min(args.steps, 6)
+        args.temperature = 0.0
+        args.temperature_end = None
+        args.top_k = 0
+        args.blockwise = True
+        args.block_size = args.block_size or 64
+        args.calibrated_confidence = False
+        args.final_fill_threshold = max(args.final_fill_threshold, 32)
+        args.quantize_dynamic = True
 
 
 def main():
@@ -48,10 +94,31 @@ def main():
     parser.add_argument("--eos_token_id", type=int, default=None)
     parser.add_argument("--blockwise", action="store_true")
     parser.add_argument("--block_size", type=int, default=None)
+    parser.add_argument("--quantize_dynamic", action="store_true", help="Apply CPU int8 dynamic quantization")
+    parser.add_argument(
+        "--edge_profile",
+        type=str,
+        default="none",
+        choices=["none", "balanced", "max"],
+        help="Edge-focused decoding presets",
+    )
+    parser.add_argument(
+        "--calibrated_confidence",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use probability-calibrated confidence in greedy decode path",
+    )
+    parser.add_argument(
+        "--final_fill_threshold",
+        type=int,
+        default=16,
+        help="Auto-fill remaining masks when count is below this threshold",
+    )
     args = parser.parse_args()
+    _apply_edge_profile(args)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model(Path(args.ckpt), device)
+    model = load_model(Path(args.ckpt), device, quantize_dynamic=args.quantize_dynamic)
 
     sp = spm.SentencePieceProcessor()
     sp.load(args.tokenizer)
@@ -68,6 +135,8 @@ def main():
         eos_token_id=args.eos_token_id,
         blockwise=args.blockwise,
         block_size=args.block_size,
+        calibrated_confidence=args.calibrated_confidence,
+        final_fill_threshold=args.final_fill_threshold,
     )
     text = sp.decode(generated[0].tolist())
     print(text)

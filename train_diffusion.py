@@ -1,0 +1,229 @@
+"""
+Train masked diffusion language model on binary token data.
+
+Example:
+    python -m diffusion.train_diffusion \
+        --data_dir data/processed \
+        --output_dir checkpoints/diffusion_hi \
+        --max_steps 5000 \
+        --seq_len 512
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import time
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader
+
+from data.dataset import BinaryTokenDataset
+from diffusion.config import DiffusionLMConfig
+from diffusion.model import DiffusionLanguageModel
+
+
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+def load_vocab_size(data_dir: Path) -> int:
+    meta_path = data_dir / "meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Missing metadata: {meta_path}")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if "vocab_size" not in meta:
+        raise KeyError(f"`vocab_size` missing in {meta_path}")
+    return int(meta["vocab_size"])
+
+
+def run_training(args: argparse.Namespace):
+    data_dir = Path(args.data_dir)
+    train_bin = data_dir / "train.bin"
+    if not train_bin.exists():
+        raise FileNotFoundError(f"Missing train data: {train_bin}")
+
+    vocab_base = load_vocab_size(data_dir)
+    # Reserve one extra id for diffusion mask token.
+    config = DiffusionLMConfig(
+        vocab_size=vocab_base + 1,
+        mask_token_id=vocab_base,
+        pad_token_id=0,
+        d_model=args.d_model,
+        n_layers=args.n_layers,
+        n_heads=args.n_heads,
+        d_ff=args.d_ff,
+        max_seq_len=args.seq_len,
+        dropout=args.dropout,
+        timesteps=args.timesteps,
+        min_mask_rate=args.min_mask_rate,
+        max_mask_rate=args.max_mask_rate,
+        sample_steps=args.sample_steps,
+        time_mode=args.time_mode,
+        timestep_sampling=args.timestep_sampling,
+        masking_strategy=args.masking_strategy,
+        mean_span_length=args.mean_span_length,
+        block_size=args.block_size,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = DiffusionLanguageModel(config).to(device)
+    if args.compile and hasattr(torch, "compile"):
+        model = torch.compile(model)
+    raw_model = _unwrap_model(model)
+
+    train_ds = BinaryTokenDataset(str(train_bin), seq_len=args.seq_len)
+    if len(train_ds) == 0:
+        raise ValueError(
+            f"Dataset has no samples for seq_len={args.seq_len}. "
+            "Use a smaller --seq_len or provide more data."
+        )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=min(4, os.cpu_count() or 1) if device.type == "cuda" else 0,
+        pin_memory=device.type == "cuda",
+        drop_last=True,
+    )
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=(0.9, 0.95),
+        weight_decay=args.weight_decay,
+    )
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 70)
+    print("Diffusion LM Training")
+    print(f"Device: {device}")
+    print(f"Params: {sum(p.numel() for p in raw_model.parameters())/1e6:.1f}M")
+    print(f"Vocab: {config.vocab_size} (base={vocab_base}, mask={config.mask_token_id})")
+    print(f"Seq len: {args.seq_len} | Batch: {args.batch_size} | Grad accum: {args.grad_accum}")
+    print(f"Timesteps: {config.timesteps} | Mask rate: {config.min_mask_rate:.2f}-{config.max_mask_rate:.2f}")
+    print(
+        f"Time mode: {config.time_mode} ({config.timestep_sampling}) | "
+        f"Masking: {config.masking_strategy} (mean_span={config.mean_span_length})"
+    )
+    print("=" * 70)
+
+    model.train()
+    data_iter = iter(train_loader)
+    optimizer.zero_grad(set_to_none=True)
+    running_loss = 0.0
+    running_mask_ratio = 0.0
+    t0 = time.time()
+
+    for step in range(args.max_steps):
+        step_loss = 0.0
+        step_mask_ratio = 0.0
+        for _ in range(args.grad_accum):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(train_loader)
+                batch = next(data_iter)
+
+            x = batch["input_ids"].to(device, non_blocking=True)
+            out = model.compute_loss(x)
+            loss = out.loss
+            (loss / args.grad_accum).backward()
+            step_loss += float(loss.item())
+            step_mask_ratio += float(out.masked_ratio or 0.0)
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        running_loss += step_loss / args.grad_accum
+        running_mask_ratio += step_mask_ratio / args.grad_accum
+
+        if (step + 1) % args.log_interval == 0 or step == 0:
+            elapsed = max(time.time() - t0, 1e-6)
+            avg_loss = running_loss / args.log_interval if step > 0 else running_loss
+            avg_mask = running_mask_ratio / args.log_interval if step > 0 else running_mask_ratio
+            ppl = math.exp(min(avg_loss, 20))
+            tok_per_sec = (
+                args.batch_size * args.grad_accum * args.seq_len * args.log_interval / elapsed
+                if step > 0
+                else args.batch_size * args.grad_accum * args.seq_len / elapsed
+            )
+            print(
+                f"step {step+1:>6d}/{args.max_steps} | "
+                f"loss {avg_loss:.4f} | ppl {ppl:>8.1f} | "
+                f"mask {avg_mask:.3f} | gnorm {float(grad_norm):.2f} | "
+                f"{tok_per_sec:,.0f} tok/s"
+            )
+            running_loss = 0.0
+            running_mask_ratio = 0.0
+            t0 = time.time()
+
+        if (step + 1) % args.save_interval == 0 or step == args.max_steps - 1:
+            ckpt = {
+                "step": step,
+                "model": raw_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "config": config.__dict__,
+            }
+            ckpt_path = out_dir / f"step_{step+1:06d}.pt"
+            torch.save(ckpt, ckpt_path)
+            torch.save(ckpt, out_dir / "latest.pt")
+            print(f"saved: {ckpt_path}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train diffusion language model")
+    parser.add_argument("--data_dir", type=str, default="data/processed")
+    parser.add_argument("--output_dir", type=str, default="checkpoints/diffusion_hi")
+    parser.add_argument("--max_steps", type=int, default=5000)
+    parser.add_argument("--save_interval", type=int, default=500)
+    parser.add_argument("--log_interval", type=int, default=10)
+
+    parser.add_argument("--seq_len", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--grad_accum", type=int, default=8)
+
+    parser.add_argument("--d_model", type=int, default=512)
+    parser.add_argument("--n_layers", type=int, default=8)
+    parser.add_argument("--n_heads", type=int, default=8)
+    parser.add_argument("--d_ff", type=int, default=1536)
+    parser.add_argument("--dropout", type=float, default=0.0)
+
+    parser.add_argument("--timesteps", type=int, default=32)
+    parser.add_argument("--sample_steps", type=int, default=16)
+    parser.add_argument("--min_mask_rate", type=float, default=0.05)
+    parser.add_argument("--max_mask_rate", type=float, default=0.95)
+    parser.add_argument(
+        "--time_mode",
+        type=str,
+        default="discrete",
+        choices=["discrete", "continuous"],
+    )
+    parser.add_argument(
+        "--timestep_sampling",
+        type=str,
+        default="uniform",
+        choices=["uniform", "stratified"],
+    )
+    parser.add_argument(
+        "--masking_strategy",
+        type=str,
+        default="token",
+        choices=["token", "span"],
+    )
+    parser.add_argument("--mean_span_length", type=float, default=3.0)
+    parser.add_argument("--block_size", type=int, default=64)
+
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile when available")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    run_training(parse_args())

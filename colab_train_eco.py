@@ -18,6 +18,8 @@ import argparse
 import sys
 from pathlib import Path
 
+import torch
+
 # Make notebook/script output visible immediately.
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
@@ -28,7 +30,7 @@ if hasattr(sys.stderr, "reconfigure"):
 # 1) package module: python -m diffusion.colab_train_eco
 # 2) top-level module/script: python -m colab_train_eco / python colab_train_eco.py
 _THIS_DIR = Path(__file__).resolve().parent
-for _p in (_THIS_DIR, _THIS_DIR.parent):
+for _p in (_THIS_DIR, _THIS_DIR.parent, _THIS_DIR / "train"):
     _s = str(_p)
     if _s not in sys.path:
         sys.path.insert(0, _s)
@@ -43,11 +45,28 @@ try:
 except ModuleNotFoundError:
     try:
         from colab_train import _resolve_path, prepare_data, setup_environment  # type: ignore # noqa: E402
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Could not import data setup helpers. Expected either "
-            "`runners/colab_train.py` or `colab_train.py` in your repo."
-        ) from exc
+    except ModuleNotFoundError:
+        def _resolve_path(path: str) -> Path:
+            return (Path.cwd() / path).resolve()
+
+        def setup_environment(allow_cpu: bool = False):
+            if torch.cuda.is_available():
+                # Safe defaults for Colab T4/L4 style GPUs.
+                return 4, 8, 512
+            if allow_cpu:
+                return 1, 1, 256
+            raise RuntimeError("No GPU found. Re-run with --allow_cpu to force CPU mode.")
+
+        def prepare_data(data_dir: str, raw_dir: str) -> str:
+            data_dir_path = _resolve_path(data_dir)
+            train_bin = data_dir_path / "train.bin"
+            meta = data_dir_path / "meta.json"
+            if not train_bin.exists() or not meta.exists():
+                raise FileNotFoundError(
+                    "Could not auto-prepare data because runners helper scripts are missing. "
+                    f"Expected preprocessed files at {data_dir_path}: train.bin and meta.json."
+                )
+            return str(train_bin)
 
 
 def main():

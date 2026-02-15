@@ -16,14 +16,77 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
-from data.dataset import BinaryTokenDataset
-from diffusion.eco_hybrid import EcoHybridConfig, EcoHybridDiffusionLM
+# Support multiple repo layouts (root/* and train/*) and invocation styles.
+_THIS_DIR = Path(__file__).resolve().parent
+for _p in (_THIS_DIR, _THIS_DIR.parent, _THIS_DIR / "train"):
+    _s = str(_p)
+    if _s not in sys.path:
+        sys.path.insert(0, _s)
+
+try:
+    from data.dataset import BinaryTokenDataset
+except ModuleNotFoundError:
+    try:
+        from train.data.dataset import BinaryTokenDataset  # type: ignore
+    except ModuleNotFoundError:
+        class BinaryTokenDataset(Dataset):
+            """
+            Fallback memmap dataset when data.dataset is unavailable.
+            Expected train.bin contains contiguous token ids.
+            """
+
+            def __init__(self, bin_path: str, seq_len: int):
+                self.bin_path = Path(bin_path)
+                self.seq_len = int(seq_len)
+                if self.seq_len < 1:
+                    raise ValueError("seq_len must be >= 1")
+                if not self.bin_path.exists():
+                    raise FileNotFoundError(f"Missing train data: {self.bin_path}")
+
+                self.meta_path = self.bin_path.with_name("meta.json")
+                dtype = self._resolve_dtype()
+                self.data = np.memmap(self.bin_path, dtype=dtype, mode="r")
+                self.n = max(0, int(self.data.shape[0]) - self.seq_len + 1)
+
+            def _resolve_dtype(self):
+                if self.meta_path.exists():
+                    try:
+                        meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
+                        name = str(meta.get("dtype", "")).lower()
+                        if name in {"uint16", "u2"}:
+                            return np.uint16
+                        if name in {"uint32", "u4"}:
+                            return np.uint32
+                        if name in {"int32", "i4"}:
+                            return np.int32
+                    except Exception:
+                        pass
+                # Most token bins are uint16; fallback to uint32 when size is incompatible.
+                size = self.bin_path.stat().st_size
+                return np.uint16 if size % 2 == 0 else np.uint32
+
+            def __len__(self) -> int:
+                return self.n
+
+            def __getitem__(self, idx: int):
+                if idx < 0 or idx >= self.n:
+                    raise IndexError(idx)
+                x = self.data[idx : idx + self.seq_len]
+                x = torch.from_numpy(np.asarray(x, dtype=np.int64))
+                return {"input_ids": x}
+
+try:
+    from diffusion.eco_hybrid import EcoHybridConfig, EcoHybridDiffusionLM
+except ModuleNotFoundError:
+    from eco_hybrid import EcoHybridConfig, EcoHybridDiffusionLM  # type: ignore
 
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:

@@ -15,7 +15,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import DiffusionLMConfig
+try:
+    from .config import DiffusionLMConfig
+except ImportError:
+    from config import DiffusionLMConfig  # type: ignore
 
 
 def timestep_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor:

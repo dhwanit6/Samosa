@@ -15,9 +15,12 @@ Usage (Colab):
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
+import numpy as np
+import sentencepiece as spm
 import torch
 
 # Make notebook/script output visible immediately.
@@ -59,13 +62,128 @@ except ModuleNotFoundError:
 
         def prepare_data(data_dir: str, raw_dir: str) -> str:
             data_dir_path = _resolve_path(data_dir)
+            raw_dir_path = _resolve_path(raw_dir)
             train_bin = data_dir_path / "train.bin"
             meta = data_dir_path / "meta.json"
-            if not train_bin.exists() or not meta.exists():
-                raise FileNotFoundError(
-                    "Could not auto-prepare data because runners helper scripts are missing. "
-                    f"Expected preprocessed files at {data_dir_path}: train.bin and meta.json."
+
+            if train_bin.exists() and meta.exists():
+                return str(train_bin)
+
+            print("[INFO] runners helper scripts not found. Using built-in auto data bootstrap.")
+            data_dir_path.mkdir(parents=True, exist_ok=True)
+            raw_dir_path.mkdir(parents=True, exist_ok=True)
+            data_root = data_dir_path.parent
+            tok_dir = data_root / "tokenizer"
+            tok_dir.mkdir(parents=True, exist_ok=True)
+
+            corpus_path = raw_dir_path / "hindi_bootstrap.txt"
+            sp_prefix = tok_dir / "aria_hindi"
+            sp_model = sp_prefix.with_suffix(".model")
+
+            def _extract_text(row: dict) -> str:
+                for key in ("text", "content", "sentence"):
+                    val = row.get(key)
+                    if isinstance(val, str):
+                        return val
+                tr = row.get("translation")
+                if isinstance(tr, dict):
+                    for key in ("hi", "hin", "en"):
+                        val = tr.get(key)
+                        if isinstance(val, str):
+                            return val
+                return ""
+
+            def _download_corpus(max_docs: int = 120_000, max_chars: int = 60_000_000) -> None:
+                try:
+                    from datasets import load_dataset
+                except Exception as exc:  # pragma: no cover
+                    raise RuntimeError(
+                        "datasets package is required for built-in data bootstrap. "
+                        "Install with: pip install datasets"
+                    ) from exc
+
+                # Try high-quality Hindi sources first.
+                candidates = [
+                    ("wikimedia/wikipedia", "20231101.hi", "train"),
+                    ("wikimedia/wikipedia", "20220301.hi", "train"),
+                    ("mc4", "hi", "train"),
+                ]
+                last_err: Exception | None = None
+
+                for name, config, split in candidates:
+                    try:
+                        print(f"[INFO] Downloading corpus from {name} ({config})...")
+                        ds = load_dataset(name, config, split=split, streaming=True)
+                        docs = 0
+                        chars = 0
+                        with corpus_path.open("w", encoding="utf-8") as f:
+                            for row in ds:
+                                text = _extract_text(row).strip()
+                                if len(text) < 40:
+                                    continue
+                                f.write(text.replace("\n", " ").strip() + "\n")
+                                docs += 1
+                                chars += len(text)
+                                if docs >= max_docs or chars >= max_chars:
+                                    break
+                        if docs == 0:
+                            raise RuntimeError(f"No usable text extracted from {name}:{config}")
+                        print(f"[OK] Collected {docs} documents ({chars/1e6:.1f}M chars)")
+                        return
+                    except Exception as exc:
+                        last_err = exc
+                        print(f"[WARN] Failed source {name}:{config} -> {exc}")
+                raise RuntimeError("All built-in dataset sources failed") from last_err
+
+            def _train_tokenizer(vocab_size: int = 16_000) -> int:
+                print("[INFO] Training SentencePiece tokenizer...")
+                spm.SentencePieceTrainer.train(
+                    input=str(corpus_path),
+                    model_prefix=str(sp_prefix),
+                    vocab_size=vocab_size,
+                    model_type="unigram",
+                    character_coverage=0.9995,
+                    input_sentence_size=2_000_000,
+                    shuffle_input_sentence=True,
+                    train_extremely_large_corpus=False,
+                    hard_vocab_limit=False,
+                    bos_id=-1,
+                    eos_id=-1,
+                    pad_id=0,
+                    unk_id=1,
                 )
+                sp = spm.SentencePieceProcessor(model_file=str(sp_model))
+                return int(sp.vocab_size())
+
+            def _encode_bin(base_vocab: int) -> None:
+                print("[INFO] Encoding corpus to train.bin...")
+                sp = spm.SentencePieceProcessor(model_file=str(sp_model))
+                dtype = np.uint16 if base_vocab < 65_535 else np.uint32
+                n_tokens = 0
+
+                with train_bin.open("wb") as out, corpus_path.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        text = line.strip()
+                        if not text:
+                            continue
+                        ids = sp.encode(text, out_type=int)
+                        if not ids:
+                            continue
+                        np.asarray(ids, dtype=dtype).tofile(out)
+                        n_tokens += len(ids)
+
+                meta_payload = {
+                    "vocab_size": int(base_vocab),
+                    "dtype": "uint16" if dtype == np.uint16 else "uint32",
+                    "train_tokens": int(n_tokens),
+                    "tokenizer_model": str(sp_model),
+                }
+                meta.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
+                print(f"[OK] Wrote {train_bin} ({n_tokens:,} tokens)")
+
+            _download_corpus()
+            vocab_size = _train_tokenizer()
+            _encode_bin(vocab_size)
             return str(train_bin)
 
 

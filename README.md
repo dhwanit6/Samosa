@@ -1,59 +1,74 @@
-# Edge Diffusion LM (Primary + Backup)
+# Edge Diffusion LM (Gujarati + Gujlish First)
 
-This repo is now intentionally lean:
+## Repository Layout
 
-- `eco_hybrid.py`: **primary model** (edge-first diffusion denoiser)
-- `model.py`: **backup model** (baseline bidirectional diffusion transformer)
-- `train.py`: canonical training entrypoint for both models
-- `sample.py`: canonical sampling/benchmark entrypoint for both models
-- `colab_train_eco.py`: one-shot Colab bootstrap + training for primary model
-- `EDGE_EFFICIENCY_THEORY.md`: math-grounded rationale + experiment protocol
-- `RESEARCH_FILTERED_IDEAS.md`: kept/rejected ideas from papers + community scan
+Core runtime:
+- `eco_hybrid.py` (primary model, edge-first)
+- `model.py` (backup model)
+- `config.py`
+- `train.py`
+- `sample.py`
+- `reasoning_layer.py` (multi-candidate reasoning + verifier + gating)
+- `safety_layer.py` (prompt/output safety checks)
+- `preference_layer.py` (warmth/harmony/ecology preference scoring)
 
-Legacy script names (`train_eco_hybrid.py`, `train_diffusion.py`, `sample_eco_hybrid.py`, `sample_diffusion.py`) are compatibility wrappers to the unified entrypoints.
+Utility runners:
+- `tools/colab_train_eco.py`
+- `tools/run_experiments.py`
+- `tools/edge_benchmark.py`
+- `tools/build_alignment_dataset.py`
+
+Documentation:
+- `docs/claude_opinion.md`
+- `docs/ECO_HYBRID_THEORY.md`
+- `docs/EDGE_EFFICIENCY_THEORY.md`
+- `docs/DIFFUSION_MODEL_DETAILED.md`
+- `docs/RESEARCH_FILTERED_IDEAS.md`
+- `docs/COLAB_ECO_RUNBOOK.md`
+
+Compatibility wrappers remain at repo root so old commands still work:
+- `colab_train_eco.py`, `run_experiments.py`, `edge_benchmark.py`, `build_alignment_dataset.py`
+- `train_eco_hybrid.py`, `train_diffusion.py`, `sample_eco_hybrid.py`, `sample_diffusion.py`
 
 ## Train
 
-Primary (recommended):
+Primary:
 
 ```bash
 python -m train \
   --model primary \
   --data_dir data/processed \
-  --output_dir checkpoints/eco_hybrid_hi \
+  --output_dir checkpoints/eco_hybrid_gu \
   --edge_profile laptop \
   --max_steps 5000
 ```
 
-Backup:
+## Colab One-Shot (Gujarati + Roman Gujarati + Gujlish)
 
 ```bash
-python -m train \
-  --model backup \
-  --data_dir data/processed \
-  --output_dir checkpoints/diffusion_hi \
-  --edge_profile laptop \
-  --max_steps 5000
+python -m tools.colab_train_eco \
+  --language gu \
+  --include_romanized \
+  --include_gujlish \
+  --quality_profile strict \
+  --max_steps 500 \
+  --save_interval 100 \
+  --log_interval 10 \
+  --compile
 ```
 
-## Colab one-shot
-
-```bash
-python -m colab_train_eco --max_steps 500 --save_interval 100 --log_interval 10 --compile
-```
-
-If data is missing, this script auto-downloads Hindi text, trains SentencePiece, and writes:
+If data is missing, it bootstraps corpus + tokenizer and writes:
 - `data/processed/train.bin`
 - `data/processed/meta.json`
 
-## Sample (edge-focused)
+## Fast Sampling
 
 ```bash
 python -m sample \
-  --ckpt checkpoints/eco_hybrid_hi/latest.pt \
-  --tokenizer data/tokenizer/aria_hindi.model \
+  --ckpt checkpoints/eco_hybrid_gu/latest.pt \
+  --tokenizer data/tokenizer/aria_gu.model \
   --model primary \
-  --prompt "mai kal bazaar gaya tha" \
+  --prompt "kem cho? aaje su plan che?" \
   --max_new_tokens 128 \
   --edge_profile max \
   --blockwise \
@@ -61,29 +76,60 @@ python -m sample \
   --min_decode_layers 3
 ```
 
-`--frozen_context` enables cached context-memory decoding for the primary model to reduce repeated full-context computation in blockwise mode.
+## Reasoning Layer
 
-## Benchmark decoding speed
+Always-on reasoning:
 
 ```bash
 python -m sample \
-  --ckpt checkpoints/eco_hybrid_hi/latest.pt \
-  --tokenizer data/tokenizer/aria_hindi.model \
+  --ckpt checkpoints/eco_hybrid_gu/latest.pt \
+  --tokenizer data/tokenizer/aria_gu.model \
   --model primary \
-  --prompt "namaste" \
-  --max_new_tokens 128 \
-  --blockwise \
-  --frozen_context \
-  --benchmark_runs 5 \
-  --warmup_runs 1
+  --prompt "aa problem nu best solution su che?" \
+  --reasoning \
+  --reasoning_candidates 6 \
+  --reasoning_verbose
 ```
 
-Or run a structured mode comparison:
+Confidence-gated reasoning (recommended default):
 
 ```bash
-python -m edge_benchmark \
-  --ckpt checkpoints/eco_hybrid_hi/latest.pt \
-  --tokenizer data/tokenizer/aria_hindi.model \
+python -m sample \
+  --ckpt checkpoints/eco_hybrid_gu/latest.pt \
+  --tokenizer data/tokenizer/aria_gu.model \
+  --model primary \
+  --prompt "mane career decision ma madad kar" \
+  --reasoning \
+  --reasoning_gate \
+  --reasoning_gate_min_confidence 0.62 \
+  --reasoning_gate_max_repetition 0.55 \
+  --reasoning_gate_min_preference 0.00 \
+  --safety_layer
+```
+
+This keeps latency close to fast-path when base confidence is good, and escalates to multi-candidate reasoning only when needed.
+
+## Alignment Dataset Build (SFT + Preference + Safety)
+
+```bash
+python -m tools.build_alignment_dataset \
+  --corpus_path data/raw/gu_bootstrap.txt \
+  --out_dir data/alignment \
+  --val_ratio 0.05
+```
+
+Outputs:
+- `data/alignment/sft_train.jsonl`
+- `data/alignment/sft_val.jsonl`
+- `data/alignment/pref_train.jsonl`
+- `data/alignment/pref_val.jsonl`
+
+## Benchmark
+
+```bash
+python -m tools.edge_benchmark \
+  --ckpt checkpoints/eco_hybrid_gu/latest.pt \
+  --tokenizer data/tokenizer/aria_gu.model \
   --model primary \
   --modes full block block_frozen \
   --runs_per_prompt 3

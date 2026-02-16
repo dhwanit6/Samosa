@@ -212,6 +212,22 @@ class EcoHybridDiffusionLM(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+    def _run_blocks(
+        self,
+        tokens: torch.Tensor,
+        memory: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+        active_layers: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        n_total = len(self.blocks)
+        if active_layers is None:
+            n_use = n_total
+        else:
+            n_use = max(1, min(int(active_layers), n_total))
+        for idx in range(n_use):
+            tokens, memory = self.blocks[idx](tokens, memory, key_padding_mask=key_padding_mask)
+        return tokens, memory
+
     def _normalized_t(self, timesteps: torch.Tensor) -> torch.Tensor:
         if self.cfg.time_mode == "continuous":
             return timesteps.float().clamp(0.0, 1.0)
@@ -324,6 +340,7 @@ class EcoHybridDiffusionLM(nn.Module):
         input_ids: torch.Tensor,
         timesteps: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        active_layers: int | None = None,
     ) -> torch.Tensor:
         bsz, seq_len = input_ids.shape
         if seq_len > self.cfg.max_seq_len:
@@ -342,11 +359,118 @@ class EcoHybridDiffusionLM(nn.Module):
         if attention_mask is not None:
             key_padding_mask = ~attention_mask.bool()
 
-        for block in self.blocks:
-            h, mem = block(h, mem, key_padding_mask=key_padding_mask)
+        h, mem = self._run_blocks(
+            tokens=h,
+            memory=mem,
+            key_padding_mask=key_padding_mask,
+            active_layers=active_layers,
+        )
 
         h = self.final_norm(h)
         return self.head(h)
+
+    def _encode_context_memory(self, context_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Encode a fixed context once and return memory slots.
+        Used by frozen-context decoding to avoid repeated full-sequence recompute.
+        """
+        bsz, seq_len = context_ids.shape
+        if seq_len > self.cfg.max_seq_len:
+            raise ValueError(f"context seq_len ({seq_len}) exceeds max_seq_len ({self.cfg.max_seq_len})")
+
+        if self.cfg.time_mode == "continuous":
+            t0 = torch.zeros((bsz,), device=context_ids.device, dtype=torch.float32)
+        else:
+            t0 = torch.zeros((bsz,), device=context_ids.device, dtype=torch.long)
+        t = self.time_mlp(timestep_embedding(t0, self.cfg.d_model)).unsqueeze(1)
+
+        mem = self.memory_slots.unsqueeze(0).expand(bsz, -1, -1) + t
+        if seq_len == 0:
+            return mem
+
+        pos = torch.arange(seq_len, device=context_ids.device)
+        h = self.token_embed(context_ids) + self.pos_embed(pos).unsqueeze(0)
+        h = h + t
+        h, mem = self._run_blocks(
+            tokens=h,
+            memory=mem,
+            key_padding_mask=None,
+            active_layers=None,
+        )
+        return mem
+
+    def _forward_with_context_memory(
+        self,
+        decode_ids: torch.Tensor,
+        timesteps: torch.Tensor,
+        context_memory: torch.Tensor,
+        pos_offset: int,
+        active_layers: int | None = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass for decode tokens conditioned on pre-encoded context memory.
+        """
+        bsz, seq_len = decode_ids.shape
+        if pos_offset + seq_len > self.cfg.max_seq_len:
+            raise ValueError(
+                f"decode positions ({pos_offset + seq_len}) exceed max_seq_len ({self.cfg.max_seq_len})"
+            )
+        pos = torch.arange(pos_offset, pos_offset + seq_len, device=decode_ids.device)
+        h = self.token_embed(decode_ids) + self.pos_embed(pos).unsqueeze(0)
+
+        t_scaled = self._normalized_t(timesteps) * max(self.cfg.timesteps - 1, 1)
+        t = self.time_mlp(timestep_embedding(t_scaled, self.cfg.d_model)).unsqueeze(1)
+        h = h + t
+
+        # Time-adapt cached context memory for this denoising step.
+        mem = context_memory + t
+        h, mem = self._run_blocks(
+            tokens=h,
+            memory=mem,
+            key_padding_mask=None,
+            active_layers=active_layers,
+        )
+
+        h = self.final_norm(h)
+        return self.head(h)
+
+    def _update_context_memory(
+        self,
+        context_memory: torch.Tensor,
+        new_token_ids: torch.Tensor,
+        pos_offset: int,
+    ) -> torch.Tensor:
+        """
+        Incrementally ingest finalized decode tokens into cached context memory.
+        This makes blockwise frozen-context decoding linear in generated tokens.
+        """
+        bsz, seq_len = new_token_ids.shape
+        if seq_len == 0:
+            return context_memory
+        if pos_offset + seq_len > self.cfg.max_seq_len:
+            raise ValueError(
+                f"context update positions ({pos_offset + seq_len}) exceed max_seq_len ({self.cfg.max_seq_len})"
+            )
+
+        pos = torch.arange(pos_offset, pos_offset + seq_len, device=new_token_ids.device)
+        h = self.token_embed(new_token_ids) + self.pos_embed(pos).unsqueeze(0)
+
+        if self.cfg.time_mode == "continuous":
+            t0 = torch.zeros((bsz,), device=new_token_ids.device, dtype=torch.float32)
+        else:
+            t0 = torch.zeros((bsz,), device=new_token_ids.device, dtype=torch.long)
+        t_scaled = self._normalized_t(t0) * max(self.cfg.timesteps - 1, 1)
+        t = self.time_mlp(timestep_embedding(t_scaled, self.cfg.d_model)).unsqueeze(1)
+        h = h + t
+
+        mem = context_memory
+        h, mem = self._run_blocks(
+            tokens=h,
+            memory=mem,
+            key_padding_mask=None,
+            active_layers=None,
+        )
+        return mem
 
     def corrupt(
         self,
@@ -410,6 +534,8 @@ class EcoHybridDiffusionLM(nn.Module):
         block_size: int | None = None,
         calibrated_confidence: bool = True,
         final_fill_threshold: int = 16,
+        frozen_context: bool = False,
+        min_decode_layers: int = 0,
     ) -> torch.Tensor:
         self.eval()
         steps = max(2, num_steps or self.cfg.sample_steps)
@@ -426,6 +552,10 @@ class EcoHybridDiffusionLM(nn.Module):
             if chunk_size < 1:
                 raise ValueError("block_size must be >= 1")
             generated = prompt_ids.clone()
+            context_memory = None
+            context_len = generated.shape[1]
+            if frozen_context:
+                context_memory = self._encode_context_memory(generated)
             remaining = max_new_tokens
             while remaining > 0:
                 chunk = min(chunk_size, remaining)
@@ -434,24 +564,55 @@ class EcoHybridDiffusionLM(nn.Module):
                     raise ValueError(
                         f"requested length ({total_len}) exceeds max_seq_len ({self.cfg.max_seq_len})"
                     )
-                tokens = torch.full(
-                    (bsz, total_len), self.cfg.mask_token_id, dtype=torch.long, device=generated.device
-                )
-                fixed = torch.zeros_like(tokens, dtype=torch.bool)
-                tokens[:, : generated.shape[1]] = generated
-                fixed[:, : generated.shape[1]] = True
-                tokens = self._decode_tokens(
-                    tokens=tokens,
-                    fixed=fixed,
-                    steps=steps,
-                    temperature=temperature,
-                    top_k=top_k,
-                    temperature_end=temperature_end,
-                    calibrated_confidence=calibrated_confidence,
-                    final_fill_threshold=final_fill_threshold,
-                )
-                new_tokens = tokens[:, -chunk:]
+                if frozen_context and context_memory is not None:
+                    block_tokens = torch.full(
+                        (bsz, chunk),
+                        self.cfg.mask_token_id,
+                        dtype=torch.long,
+                        device=generated.device,
+                    )
+                    block_fixed = torch.zeros_like(block_tokens, dtype=torch.bool)
+                    block_tokens = self._decode_tokens(
+                        tokens=block_tokens,
+                        fixed=block_fixed,
+                        steps=steps,
+                        temperature=temperature,
+                        top_k=top_k,
+                        temperature_end=temperature_end,
+                        calibrated_confidence=calibrated_confidence,
+                        final_fill_threshold=final_fill_threshold,
+                        context_memory=context_memory,
+                        pos_offset=context_len,
+                        min_decode_layers=min_decode_layers,
+                    )
+                    new_tokens = block_tokens
+                else:
+                    tokens = torch.full(
+                        (bsz, total_len), self.cfg.mask_token_id, dtype=torch.long, device=generated.device
+                    )
+                    fixed = torch.zeros_like(tokens, dtype=torch.bool)
+                    tokens[:, : generated.shape[1]] = generated
+                    fixed[:, : generated.shape[1]] = True
+                    tokens = self._decode_tokens(
+                        tokens=tokens,
+                        fixed=fixed,
+                        steps=steps,
+                        temperature=temperature,
+                        top_k=top_k,
+                        temperature_end=temperature_end,
+                        calibrated_confidence=calibrated_confidence,
+                        final_fill_threshold=final_fill_threshold,
+                        min_decode_layers=min_decode_layers,
+                    )
+                    new_tokens = tokens[:, -chunk:]
                 generated = torch.cat([generated, new_tokens], dim=1)
+                if frozen_context and context_memory is not None:
+                    context_memory = self._update_context_memory(
+                        context_memory=context_memory,
+                        new_token_ids=new_tokens,
+                        pos_offset=context_len,
+                    )
+                    context_len += new_tokens.shape[1]
                 remaining -= chunk
                 if eos_token_id is not None:
                     eos = (new_tokens[0] == eos_token_id).nonzero(as_tuple=False).squeeze(-1)
@@ -484,6 +645,7 @@ class EcoHybridDiffusionLM(nn.Module):
             temperature_end=temperature_end,
             calibrated_confidence=calibrated_confidence,
             final_fill_threshold=final_fill_threshold,
+            min_decode_layers=min_decode_layers,
         )
         continuation = tokens[:, prompt_len:]
         if eos_token_id is not None:
@@ -503,8 +665,13 @@ class EcoHybridDiffusionLM(nn.Module):
         temperature_end: float | None,
         calibrated_confidence: bool,
         final_fill_threshold: int,
+        context_memory: torch.Tensor | None = None,
+        pos_offset: int = 0,
+        min_decode_layers: int = 0,
     ) -> torch.Tensor:
         bsz, total_len = tokens.shape
+        n_total_layers = len(self.blocks)
+        min_layers = max(0, min(int(min_decode_layers), n_total_layers))
         for s in range(steps - 1, -1, -1):
             t = self._inference_timesteps(
                 reverse_step=s,
@@ -512,7 +679,22 @@ class EcoHybridDiffusionLM(nn.Module):
                 batch_size=bsz,
                 device=tokens.device,
             )
-            logits = self.forward(tokens, t)
+            active_layers = None
+            if min_layers > 0 and n_total_layers > 1:
+                progress = 1.0 - (s / max(steps - 1, 1))
+                span = n_total_layers - min_layers
+                active_layers = min_layers + int(math.ceil(span * progress))
+                active_layers = max(1, min(active_layers, n_total_layers))
+            if context_memory is None:
+                logits = self.forward(tokens, t, active_layers=active_layers)
+            else:
+                logits = self._forward_with_context_memory(
+                    decode_ids=tokens,
+                    timesteps=t,
+                    context_memory=context_memory,
+                    pos_offset=pos_offset,
+                    active_layers=active_layers,
+                )
             logits[..., self.cfg.mask_token_id] = -torch.inf
 
             step_temp = self._step_temperature(
@@ -587,7 +769,15 @@ class EcoHybridDiffusionLM(nn.Module):
                 batch_size=bsz,
                 device=tokens.device,
             )
-            logits = self.forward(tokens, t0)
+            if context_memory is None:
+                logits = self.forward(tokens, t0)
+            else:
+                logits = self._forward_with_context_memory(
+                    decode_ids=tokens,
+                    timesteps=t0,
+                    context_memory=context_memory,
+                    pos_offset=pos_offset,
+                )
             logits[..., self.cfg.mask_token_id] = -torch.inf
             tokens[remaining] = logits.argmax(dim=-1)[remaining]
 

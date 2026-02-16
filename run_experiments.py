@@ -2,7 +2,7 @@
 Ablation runner for matched diffusion experiments.
 
 This script executes a controlled matrix over:
-1. architecture: baseline transformer vs EcoHybrid
+1. architecture: backup transformer vs primary EcoHybrid
 2. timestep mode: discrete vs continuous
 3. masking strategy: token vs span
 
@@ -67,15 +67,14 @@ def _build_specs(args: argparse.Namespace) -> list[ExperimentSpec]:
                 run_args = dict(shared)
                 run_args.update(
                     {
+                        "model": arch,
                         "output_dir": out_dir,
                         "time_mode": time_mode,
                         "masking_strategy": masking,
                     }
                 )
-                if arch == "baseline":
-                    module = "diffusion.train_diffusion"
-                else:
-                    module = "diffusion.train_eco_hybrid"
+                module = "train"
+                if arch == "primary":
                     run_args.update(
                         {
                             "memory_slots": str(args.memory_slots),
@@ -96,8 +95,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--architectures",
         nargs="+",
-        default=["baseline", "eco"],
-        choices=["baseline", "eco"],
+        default=["backup", "primary"],
+        choices=["backup", "primary"],
     )
     p.add_argument(
         "--time_modes",

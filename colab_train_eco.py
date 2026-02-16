@@ -9,8 +9,8 @@ What it does:
 
 Usage (Colab):
     !git clone <your-repo-url> Aria
-    %cd Aria/train
-    !python -m diffusion.colab_train_eco --max_steps 500
+    %cd Aria
+    !python -m colab_train_eco --max_steps 500
 """
 from __future__ import annotations
 
@@ -39,9 +39,9 @@ for _p in (_THIS_DIR, _THIS_DIR.parent, _THIS_DIR / "train"):
         sys.path.insert(0, _s)
 
 try:
-    from diffusion.train_eco_hybrid import train as train_eco  # noqa: E402
+    from diffusion.train import train as train_unified  # noqa: E402
 except ModuleNotFoundError:
-    from train_eco_hybrid import train as train_eco  # type: ignore # noqa: E402
+    from train import train as train_unified  # type: ignore # noqa: E402
 
 try:
     from runners.colab_train import _resolve_path, prepare_data, setup_environment  # noqa: E402
@@ -290,9 +290,10 @@ def main():
             )
         data_path = prepare_data(args.data_dir, args.raw_dir)
 
-    # train_eco expects --data_dir containing train.bin/meta.json.
+    # train expects --data_dir containing train.bin/meta.json.
     args.data_dir = str(Path(data_path).parent)
-    train_eco(args)
+    args.model = "primary"
+    train_unified(args)
 
 
 if __name__ == "__main__":

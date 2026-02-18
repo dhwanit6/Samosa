@@ -160,7 +160,7 @@ except ModuleNotFoundError:
             hint_hits = sum(1 for tok in _GUJ_TOKEN_HINTS if tok in low)
             return hint_hits >= 1
 
-        def _to_gujlish(roman_text: str) -> str:
+        def _to_gujlish(roman_text: str, rng: np.random.Generator) -> str:
             """
             Light Gujarati+English code-mix transformation for chat-style robustness.
             """
@@ -183,14 +183,14 @@ except ModuleNotFoundError:
                 return roman_text
             out = toks[:]
             n_changes = max(1, int(round(0.15 * len(out))))
-            idxs = np.random.permutation(len(out))[:n_changes]
+            idxs = rng.permutation(len(out))[:n_changes]
             for idx in idxs:
                 key = out[idx].lower().strip(".,!?;:")
                 if key in swaps:
                     out[idx] = swaps[key]
-            if np.random.rand() < 0.30:
+            if float(rng.random()) < 0.30:
                 out.append("please")
-            if np.random.rand() < 0.20:
+            if float(rng.random()) < 0.20:
                 out.append("thanks")
             return _SPACE_RE.sub(" ", " ".join(out)).strip()
 
@@ -237,7 +237,9 @@ except ModuleNotFoundError:
             quality_profile: str = "strict",
             max_docs: int = 160_000,
             max_chars: int = 80_000_000,
+            min_native_docs: int = 30_000,
             vocab_size: int = 20_000,
+            seed: int = 1337,
         ) -> str:
             data_dir_path = _resolve_path(data_dir)
             raw_dir_path = _resolve_path(raw_dir)
@@ -253,11 +255,13 @@ except ModuleNotFoundError:
 
             lang = str(language).strip().lower()
             strict = quality_profile == "strict"
+            bootstrap_version = 2
             corpus_path = raw_dir_path / f"{lang}_bootstrap.txt"
             sp_prefix = tok_dir / f"aria_{lang}"
             sp_model = sp_prefix.with_suffix(".model")
             romanized_ratio = max(0.0, min(float(romanized_ratio), 1.0))
             gujlish_ratio = max(0.0, min(float(gujlish_ratio), 1.0))
+            rng = np.random.default_rng(int(seed))
 
             if train_bin.exists() and meta.exists():
                 try:
@@ -275,6 +279,12 @@ except ModuleNotFoundError:
                     mismatch.append(f"include_gujlish={prev.get('include_gujlish')} -> {include_gujlish}")
                 if str(prev.get("quality_profile", "")).lower() != str(quality_profile).lower():
                     mismatch.append(f"quality_profile={prev.get('quality_profile')} -> {quality_profile}")
+                if int(prev.get("bootstrap_version", -1)) != bootstrap_version:
+                    mismatch.append(
+                        f"bootstrap_version={prev.get('bootstrap_version', 'missing')} -> {bootstrap_version}"
+                    )
+                if int(prev.get("bootstrap_seed", -1)) != int(seed):
+                    mismatch.append(f"bootstrap_seed={prev.get('bootstrap_seed', 'missing')} -> {int(seed)}")
                 if not mismatch:
                     print(f"[OK] Reusing existing processed data: {train_bin}")
                     return str(train_bin)
@@ -294,7 +304,7 @@ except ModuleNotFoundError:
                             return val
                 return ""
 
-            def _download_corpus(max_docs: int, max_chars: int) -> tuple[int, int, int]:
+            def _download_corpus(max_docs: int, max_chars: int, min_native_docs: int) -> tuple[int, int, int]:
                 try:
                     from datasets import load_dataset
                 except Exception as exc:  # pragma: no cover
@@ -316,12 +326,14 @@ except ModuleNotFoundError:
                 kept_roman = 0
                 kept_gujlish = 0
                 chars = 0
+                successful_sources = 0
 
-                for name, config, split in candidates:
-                    try:
-                        print(f"[INFO] Downloading corpus from {name} ({config})...")
-                        ds = load_dataset(name, config, split=split, streaming=True)
-                        with corpus_path.open("w", encoding="utf-8") as f:
+                with corpus_path.open("w", encoding="utf-8") as f:
+                    for name, config, split in candidates:
+                        try:
+                            print(f"[INFO] Downloading corpus from {name} ({config})...")
+                            ds = load_dataset(name, config, split=split, streaming=True)
+                            before = kept_native
                             for row in ds:
                                 raw = _extract_text(row)
                                 text = _normalize_text(raw)
@@ -337,15 +349,19 @@ except ModuleNotFoundError:
                                 chars += len(text)
 
                                 if include_romanized and romanized_ratio > 0.0:
-                                    if np.random.rand() < romanized_ratio:
+                                    if float(rng.random()) < romanized_ratio:
                                         rom = _to_roman_gujarati(text)
                                         rom = _normalize_text(rom)
                                         if _looks_reasonable_romanized(rom):
                                             f.write(rom + "\n")
                                             kept_roman += 1
                                             chars += len(rom)
-                                            if include_gujlish and gujlish_ratio > 0.0 and np.random.rand() < gujlish_ratio:
-                                                mix = _to_gujlish(rom)
+                                            if (
+                                                include_gujlish
+                                                and gujlish_ratio > 0.0
+                                                and float(rng.random()) < gujlish_ratio
+                                            ):
+                                                mix = _to_gujlish(rom, rng=rng)
                                                 if _looks_reasonable_romanized(mix):
                                                     f.write(mix + "\n")
                                                     kept_gujlish += 1
@@ -353,24 +369,40 @@ except ModuleNotFoundError:
 
                                 if kept_native >= max_docs or chars >= max_chars:
                                     break
-                        if kept_native == 0:
-                            raise RuntimeError(f"No usable text extracted from {name}:{config}")
-                        print(
-                            f"[OK] Collected native={kept_native:,}, romanized={kept_roman:,}, "
-                            f"gujlish={kept_gujlish:,} "
-                            f"({chars/1e6:.1f}M chars)"
-                        )
-                        if include_values_pack and values_pack_repeat > 0:
-                            values = _alignment_values_pack(include_romanized=include_romanized)
-                            with corpus_path.open("a", encoding="utf-8") as f:
-                                for _ in range(max(1, int(values_pack_repeat))):
-                                    for line in values:
-                                        f.write(_normalize_text(line) + "\n")
-                        return kept_native, kept_roman, kept_gujlish
-                    except Exception as exc:
-                        last_err = exc
-                        print(f"[WARN] Failed source {name}:{config} -> {exc}")
-                raise RuntimeError("All built-in dataset sources failed") from last_err
+                            gained = kept_native - before
+                            if gained > 0:
+                                successful_sources += 1
+                            print(
+                                f"[INFO] Source done: {name}:{config} | "
+                                f"accepted_native={gained:,} | total_native={kept_native:,}"
+                            )
+                            if kept_native >= max_docs or chars >= max_chars:
+                                break
+                        except Exception as exc:
+                            last_err = exc
+                            print(f"[WARN] Failed source {name}:{config} -> {exc}")
+
+                if kept_native == 0:
+                    raise RuntimeError("All built-in dataset sources failed or produced zero usable text") from last_err
+
+                if kept_native < int(min_native_docs):
+                    raise RuntimeError(
+                        f"Collected only {kept_native:,} native Gujarati lines, below minimum {min_native_docs:,}. "
+                        "Increase max_docs/max_chars or use balanced quality profile."
+                    )
+
+                print(
+                    f"[OK] Collected native={kept_native:,}, romanized={kept_roman:,}, "
+                    f"gujlish={kept_gujlish:,}, sources={successful_sources} "
+                    f"({chars/1e6:.1f}M chars)"
+                )
+                if include_values_pack and values_pack_repeat > 0:
+                    values = _alignment_values_pack(include_romanized=include_romanized)
+                    with corpus_path.open("a", encoding="utf-8") as f:
+                        for _ in range(max(1, int(values_pack_repeat))):
+                            for line in values:
+                                f.write(_normalize_text(line) + "\n")
+                return kept_native, kept_roman, kept_gujlish
 
             def _train_tokenizer(vocab_size: int) -> int:
                 print("[INFO] Training SentencePiece tokenizer...")
@@ -422,11 +454,17 @@ except ModuleNotFoundError:
                     "gujlish_ratio": float(gujlish_ratio),
                     "include_values_pack": bool(include_values_pack),
                     "values_pack_repeat": int(values_pack_repeat),
+                    "bootstrap_version": int(bootstrap_version),
+                    "bootstrap_seed": int(seed),
                 }
                 meta.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
                 print(f"[OK] Wrote {train_bin} ({n_tokens:,} tokens)")
 
-            native_count, roman_count, gujlish_count = _download_corpus(max_docs=max_docs, max_chars=max_chars)
+            native_count, roman_count, gujlish_count = _download_corpus(
+                max_docs=max_docs,
+                max_chars=max_chars,
+                min_native_docs=min_native_docs,
+            )
             vocab_size = _train_tokenizer(vocab_size=vocab_size)
             _encode_bin(vocab_size)
             print(
@@ -495,6 +533,18 @@ def main():
     )
     parser.add_argument("--bootstrap_max_docs", type=int, default=160_000)
     parser.add_argument("--bootstrap_max_chars", type=int, default=80_000_000)
+    parser.add_argument(
+        "--bootstrap_seed",
+        type=int,
+        default=1337,
+        help="Random seed for corpus augmentation (romanized + gujlish variants)",
+    )
+    parser.add_argument(
+        "--bootstrap_min_native_docs",
+        type=int,
+        default=30_000,
+        help="Fail bootstrap if accepted native Gujarati lines are below this threshold",
+    )
     parser.add_argument("--tokenizer_vocab_size", type=int, default=20_000)
 
     # Training controls
@@ -507,8 +557,9 @@ def main():
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--grad_accum", type=int, default=None)
     parser.add_argument("--seq_len", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.02)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--no_amp", action="store_true", help="Disable CUDA AMP")
     parser.add_argument(
@@ -539,28 +590,40 @@ def main():
     parser.add_argument("--timesteps", type=int, default=32)
     parser.add_argument("--sample_steps", type=int, default=12)
     parser.add_argument("--min_mask_rate", type=float, default=0.05)
-    parser.add_argument("--max_mask_rate", type=float, default=0.95)
+    parser.add_argument("--max_mask_rate", type=float, default=0.85)
     parser.add_argument("--confidence_stop", type=float, default=0.98)
     parser.add_argument(
         "--time_mode",
         type=str,
-        default="discrete",
+        default="continuous",
         choices=["discrete", "continuous"],
     )
     parser.add_argument(
         "--timestep_sampling",
         type=str,
-        default="uniform",
+        default="stratified",
         choices=["uniform", "stratified"],
     )
     parser.add_argument(
         "--masking_strategy",
         type=str,
-        default="token",
+        default="span",
         choices=["token", "span"],
     )
     parser.add_argument("--mean_span_length", type=float, default=3.0)
     parser.add_argument("--block_size", type=int, default=64)
+    parser.add_argument("--mask_curriculum_steps", type=int, default=1500)
+    parser.add_argument("--start_min_mask_rate", type=float, default=0.02)
+    parser.add_argument("--start_max_mask_rate", type=float, default=0.40)
+    parser.add_argument(
+        "--lr_schedule",
+        type=str,
+        default="cosine",
+        choices=["constant", "cosine"],
+        help="Learning-rate schedule",
+    )
+    parser.add_argument("--warmup_steps", type=int, default=300)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.10)
 
     args = parser.parse_args()
 
@@ -601,6 +664,8 @@ def main():
             "quality_profile": args.quality_profile,
             "max_docs": args.bootstrap_max_docs,
             "max_chars": args.bootstrap_max_chars,
+            "seed": args.bootstrap_seed,
+            "min_native_docs": args.bootstrap_min_native_docs,
             "vocab_size": args.tokenizer_vocab_size,
         }
         try:

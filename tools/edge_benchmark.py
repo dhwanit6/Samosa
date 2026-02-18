@@ -10,6 +10,7 @@ The pseudo log-likelihood is a ranking proxy, not calibrated perplexity.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import statistics
 import sys
@@ -47,6 +48,40 @@ def _normalize_state_dict_keys(state_dict: dict[str, torch.Tensor]) -> dict[str,
     return state_dict
 
 
+def _build_config(config_cls, cfg_data: dict, model_type: str):
+    try:
+        return config_cls(**cfg_data)
+    except TypeError:
+        # Backward/forward compatibility: ignore unknown checkpoint keys.
+        params = inspect.signature(config_cls).parameters
+        filtered = {k: v for k, v in cfg_data.items() if k in params}
+        dropped = sorted(k for k in cfg_data.keys() if k not in params)
+        if dropped:
+            print(
+                f"[WARN] Dropping {len(dropped)} unknown config keys for {model_type} model: "
+                + ", ".join(dropped)
+            )
+        return config_cls(**filtered)
+
+
+def _sanitize_prompt_ids(
+    prompt_ids: list[int],
+    model_vocab_size: int,
+    replacement_id: int,
+) -> tuple[list[int], int]:
+    if model_vocab_size <= 0:
+        return prompt_ids, 0
+    fixed: list[int] = []
+    replaced = 0
+    for tid in prompt_ids:
+        if 0 <= tid < model_vocab_size:
+            fixed.append(tid)
+        else:
+            fixed.append(replacement_id)
+            replaced += 1
+    return fixed, replaced
+
+
 def _load_model(
     ckpt_path: Path,
     device: torch.device,
@@ -63,10 +98,10 @@ def _load_model(
             model_type = "primary" if "memory_slots" in cfg_data else "backup"
 
     if model_type == "primary":
-        cfg = EcoHybridConfig(**cfg_data)
+        cfg = _build_config(EcoHybridConfig, cfg_data, model_type="primary")
         model = EcoHybridDiffusionLM(cfg).to(device)
     else:
-        cfg = DiffusionLMConfig(**cfg_data)
+        cfg = _build_config(DiffusionLMConfig, cfg_data, model_type="backup")
         model = DiffusionLanguageModel(cfg).to(device)
 
     model.load_state_dict(state)
@@ -86,11 +121,18 @@ def _t0(cfg, batch_size: int, device: torch.device) -> torch.Tensor:
     return torch.zeros((batch_size,), dtype=torch.long, device=device)
 
 
+def _model_cfg(model):
+    return getattr(model, "cfg", getattr(model, "config", None))
+
+
 @torch.inference_mode()
 def _pseudo_logp(model, full_ids: torch.Tensor, prompt_len: int) -> float:
     if full_ids.shape[1] <= prompt_len:
         return float("nan")
-    logits = model.forward(full_ids, _t0(model.cfg, full_ids.shape[0], full_ids.device))
+    cfg = _model_cfg(model)
+    if cfg is None:
+        raise RuntimeError("Could not resolve model config for pseudo log-prob computation")
+    logits = model.forward(full_ids, _t0(cfg, full_ids.shape[0], full_ids.device))
     logp = F.log_softmax(logits.float(), dim=-1)
     tok_lp = logp.gather(-1, full_ids.unsqueeze(-1)).squeeze(-1)
     cont_lp = tok_lp[:, prompt_len:]
@@ -185,6 +227,18 @@ def main() -> None:
     sp = spm.SentencePieceProcessor()
     sp.load(args.tokenizer)
     prompts = _read_prompts(args)
+    cfg = _model_cfg(model)
+    if cfg is None:
+        raise RuntimeError("Could not resolve model config after loading checkpoint")
+    model_vocab_n = int(getattr(cfg, "vocab_size", 0))
+    tok_vocab_n = int(sp.vocab_size())
+    if model_vocab_n > 0 and tok_vocab_n != model_vocab_n:
+        print(
+            f"[WARN] tokenizer vocab ({tok_vocab_n}) != model vocab ({model_vocab_n}). "
+            "Out-of-range prompt ids will be mapped to a safe token."
+        )
+    tok_unk = int(sp.unk_id())
+    replacement_id = tok_unk if 0 <= tok_unk < max(model_vocab_n, 1) else (1 if model_vocab_n > 1 else 0)
 
     results: dict[str, dict] = {}
     with torch.inference_mode():
@@ -197,6 +251,16 @@ def main() -> None:
 
             for prompt_text in prompts:
                 prompt_ids = sp.encode(prompt_text, out_type=int)
+                prompt_ids, replaced = _sanitize_prompt_ids(
+                    prompt_ids=prompt_ids,
+                    model_vocab_size=model_vocab_n,
+                    replacement_id=replacement_id,
+                )
+                if replaced > 0:
+                    print(
+                        f"[WARN] mapped {replaced} prompt token ids outside model vocab "
+                        f"to id {replacement_id} for prompt: {prompt_text!r}"
+                    )
                 prompt = torch.tensor([prompt_ids], dtype=torch.long, device=device)
                 gen_kwargs = dict(
                     prompt_ids=prompt,

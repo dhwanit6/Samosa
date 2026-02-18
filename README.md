@@ -57,6 +57,10 @@ python -m tools.colab_train_eco \
   --compile
 ```
 
+Recommended stabilization knobs for first 5k steps:
+- `--lr_schedule cosine --warmup_steps 300 --min_lr_ratio 0.10`
+- `--mask_curriculum_steps 1500 --start_min_mask_rate 0.02 --start_max_mask_rate 0.40`
+
 If data is missing, it bootstraps corpus + tokenizer and writes:
 - `data/processed/train.bin`
 - `data/processed/meta.json`

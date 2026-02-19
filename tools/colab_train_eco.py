@@ -3,7 +3,7 @@ Colab-ready one-shot runner for EcoHybrid diffusion training.
 
 What it does:
 1. Detects GPU and chooses safe defaults.
-2. Auto-downloads Gujarati-centric data if missing.
+2. Auto-downloads language-matched corpora if missing.
 3. Auto-trains tokenizer and preprocesses to binary if missing.
 4. Trains EcoHybrid diffusion model.
 
@@ -64,14 +64,34 @@ except ModuleNotFoundError:
             raise RuntimeError("No GPU found. Re-run with --allow_cpu to force CPU mode.")
 
         _GUJ_CHAR_RE = re.compile(r"[\u0A80-\u0AFF]")
+        _DEV_CHAR_RE = re.compile(r"[\u0900-\u097F]")
         _LATIN_RE = re.compile(r"[A-Za-z]")
         _URL_RE = re.compile(r"(https?://|www\.)", flags=re.IGNORECASE)
         _SPACE_RE = re.compile(r"\s+")
+        _PUNCT_BURST_RE = re.compile(r"([!?,.\-_*])\1{5,}")
 
-        _GUJ_TOKEN_HINTS = (
-            "che", "chhe", "ane", "nathi", "karvu", "tame", "hu", "shu", "kem", "pan",
-            "mate", "chho", "hatu", "hati", "hata", "kai", "koi", "pachi", "aaje", "kal",
-        )
+        _LANG_TOKEN_HINTS = {
+            "gu": (
+                "che", "chhe", "ane", "nathi", "karvu", "tame", "hu", "shu", "kem", "pan",
+                "mate", "chho", "hatu", "hati", "hata", "kai", "koi", "pachi", "aaje", "kal",
+            ),
+            "hi": (
+                "hai", "hain", "nahi", "aur", "kyu", "kyon", "kya", "hum", "aap", "kaise",
+                "accha", "bura", "kripya", "dhanyavad",
+            ),
+        }
+
+        def _canon_lang(language: str) -> str:
+            code = str(language).strip().lower()
+            alias = {
+                "eng": "en",
+                "english": "en",
+                "hin": "hi",
+                "hindi": "hi",
+                "guj": "gu",
+                "gujarati": "gu",
+            }
+            return alias.get(code, code)
 
         def _normalize_text(s: str) -> str:
             s = unicodedata.normalize("NFKC", s)
@@ -84,100 +104,94 @@ except ModuleNotFoundError:
                 return 0.0
             return sum(1 for ch in text if pattern.match(ch)) / max(len(text), 1)
 
-        def _looks_high_quality_gujarati(text: str, strict: bool) -> bool:
-            if len(text) < (45 if strict else 28):
+        def _looks_high_quality_text(text: str, lang: str, strict: bool) -> bool:
+            if len(text) < (45 if strict else 26):
                 return False
             if _URL_RE.search(text):
                 return False
+            if _PUNCT_BURST_RE.search(text):
+                return False
 
             gu_ratio = _char_ratio(text, _GUJ_CHAR_RE)
+            dev_ratio = _char_ratio(text, _DEV_CHAR_RE)
             latin_ratio = _char_ratio(text, _LATIN_RE)
             punct_ratio = sum(1 for ch in text if unicodedata.category(ch).startswith("P")) / max(len(text), 1)
 
+            if lang == "gu":
+                if strict:
+                    return gu_ratio >= 0.42 and latin_ratio <= 0.18 and punct_ratio <= 0.24
+                return gu_ratio >= 0.30 and latin_ratio <= 0.30 and punct_ratio <= 0.30
+
+            if lang == "hi":
+                if strict:
+                    return dev_ratio >= 0.44 and latin_ratio <= 0.20 and punct_ratio <= 0.24
+                return dev_ratio >= 0.30 and latin_ratio <= 0.35 and punct_ratio <= 0.30
+
+            # English fallback.
             if strict:
-                if gu_ratio < 0.42:
-                    return False
-                if latin_ratio > 0.18:
-                    return False
-                if punct_ratio > 0.24:
-                    return False
-            else:
-                if gu_ratio < 0.30:
-                    return False
-                if latin_ratio > 0.30:
-                    return False
-                if punct_ratio > 0.30:
-                    return False
+                return (
+                    latin_ratio >= 0.60
+                    and punct_ratio <= 0.30
+                    and gu_ratio <= 0.05
+                    and dev_ratio <= 0.05
+                )
+            return latin_ratio >= 0.45 and punct_ratio <= 0.34
 
-            # Reject obvious duplicated spam patterns.
-            if any(ch * 6 in text for ch in ("!", "?", ".", ",", "-", "_", "*")):
-                return False
-
-            return True
-
-        def _to_roman_gujarati(text: str) -> str:
-            """
-            Gujarati -> ASCII-leaning Roman transliteration.
-            Uses indic_transliteration when available; falls back to a coarse map.
-            """
+        def _to_roman_indic(text: str, lang: str) -> str:
+            if lang not in {"gu", "hi"}:
+                return text
             try:
                 from indic_transliteration import sanscript  # type: ignore
                 from indic_transliteration.sanscript import transliterate  # type: ignore
 
-                out = transliterate(text, sanscript.GUJARATI, sanscript.ITRANS)
+                source = sanscript.GUJARATI if lang == "gu" else sanscript.DEVANAGARI
+                out = transliterate(text, source, sanscript.ITRANS)
                 out = out.replace("~N", "n").replace(".N", "n").replace(".m", "m")
                 out = out.replace("RRi", "ri").replace("RRI", "ri")
-                out = _SPACE_RE.sub(" ", out).strip()
-                return out
+                return _SPACE_RE.sub(" ", out).strip()
             except Exception:
-                # Fallback is intentionally simple and approximate.
-                base_map = {
-                    "અ": "a", "આ": "aa", "ઇ": "i", "ઈ": "ii", "ઉ": "u", "ઊ": "uu",
-                    "ઋ": "ri", "એ": "e", "ઐ": "ai", "ઓ": "o", "ઔ": "au",
-                    "ક": "k", "ખ": "kh", "ગ": "g", "ઘ": "gh", "ચ": "ch", "છ": "chh",
-                    "જ": "j", "ઝ": "jh", "ટ": "t", "ઠ": "th", "ડ": "d", "ઢ": "dh",
-                    "ણ": "n", "ત": "t", "થ": "th", "દ": "d", "ધ": "dh", "ન": "n",
-                    "પ": "p", "ફ": "ph", "બ": "b", "ભ": "bh", "મ": "m",
-                    "ય": "y", "ર": "r", "લ": "l", "વ": "v", "શ": "sh", "ષ": "sh",
-                    "સ": "s", "હ": "h", "ળ": "l",
-                    "ા": "aa", "િ": "i", "ી": "ii", "ુ": "u", "ૂ": "uu",
-                    "ે": "e", "ૈ": "ai", "ો": "o", "ૌ": "au", "ં": "n", "ઃ": "h",
-                    "્": "", "઼": "",
-                    "૦": "0", "૧": "1", "૨": "2", "૩": "3", "૪": "4",
-                    "૫": "5", "૬": "6", "૭": "7", "૮": "8", "૯": "9",
-                }
-                out = "".join(base_map.get(ch, ch) for ch in text)
-                out = _SPACE_RE.sub(" ", out).strip()
-                return out
+                return text
 
-        def _looks_reasonable_romanized(text: str) -> bool:
+        def _looks_reasonable_romanized(text: str, lang: str) -> bool:
             if len(text) < 20:
                 return False
             latin_ratio = _char_ratio(text, _LATIN_RE)
             if latin_ratio < 0.55:
                 return False
+            hints = _LANG_TOKEN_HINTS.get(lang, ())
+            if not hints:
+                return True
             low = text.lower()
-            hint_hits = sum(1 for tok in _GUJ_TOKEN_HINTS if tok in low)
+            hint_hits = sum(1 for tok in hints if tok in low)
             return hint_hits >= 1
 
-        def _to_gujlish(roman_text: str, rng: np.random.Generator) -> str:
-            """
-            Light Gujarati+English code-mix transformation for chat-style robustness.
-            """
-            swaps = {
-                "ane": "and",
-                "pan": "but",
-                "che": "is",
-                "chhe": "is",
-                "nathi": "not",
-                "saru": "good",
-                "kharab": "bad",
-                "madad": "help",
-                "samaj": "understand",
-                "jaldi": "quick",
-                "aaje": "today",
-                "kal": "tomorrow",
+        def _to_code_mix(roman_text: str, lang: str, rng: np.random.Generator) -> str:
+            swaps_by_lang = {
+                "gu": {
+                    "ane": "and",
+                    "pan": "but",
+                    "che": "is",
+                    "chhe": "is",
+                    "nathi": "not",
+                    "madad": "help",
+                    "samaj": "understand",
+                    "aaje": "today",
+                    "kal": "tomorrow",
+                },
+                "hi": {
+                    "aur": "and",
+                    "hai": "is",
+                    "hain": "are",
+                    "nahi": "not",
+                    "madad": "help",
+                    "samajh": "understand",
+                    "aaj": "today",
+                    "kal": "tomorrow",
+                },
             }
+            swaps = swaps_by_lang.get(lang, {})
+            if not swaps:
+                return roman_text
             toks = roman_text.split()
             if not toks:
                 return roman_text
@@ -194,35 +208,108 @@ except ModuleNotFoundError:
                 out.append("thanks")
             return _SPACE_RE.sub(" ", " ".join(out)).strip()
 
-        def _alignment_values_pack(include_romanized: bool) -> list[str]:
-            """
-            Small, high-quality values corpus seed for empathy + ecological ethics.
-            """
-            native = [
-                "હું હંમેશાં સહાનુભૂતિ, સત્ય અને અહિંસા સાથે વાત કરું છું.",
-                "હર વ્યક્તિનો માન-સન્માન કરવો એ મારી પ્રથમ જવાબદારી છે.",
-                "પ્રકૃતિ, પાણી, વૃક્ષો અને દરેક પ્રાણી માટે દયા રાખવી જોઈએ.",
-                "મારા જવાબો શાંતિ, સમતોલતા અને સહકારને પ્રોત્સાહિત કરે છે.",
-                "હું અહંકાર નહીં, સેવા અને વિનમ્રતા પસંદ કરું છું.",
-                "મતભેદમાં પણ સંવાદ અને કરુણાથી ઉકેલ શોધવો શ્રેષ્ઠ છે.",
-                "હું કોઈને નુકસાન કરતું માર્ગદર્શન નથી આપતો.",
-                "હું ભય નહીં, આશા અને જવાબદારી તરફ દોરી જાઉં છું.",
-                "અન્ય સંસ્કૃતિઓનો આદર કરવો એ માનવતા માટે જરૂરી છે.",
-                "ધરતી બધાની છે; વિકાસ અને પર્યાવરણ બંનેનું સંતુલન રાખવું પડે.",
+        def _alignment_values_pack(lang: str, include_romanized: bool) -> list[str]:
+            base_en = [
+                "I respond with empathy, honesty, and non-violence.",
+                "I respect all people and avoid harmful guidance.",
+                "I support harmony, dialogue, and emotional care.",
+                "I value ecology, biodiversity, and long-term planetary health.",
+                "I prefer humility, service, and cooperation over ego.",
             ]
-            if not include_romanized:
-                return native
-            roman = [
-                "Hu hamesha sahanubhuti, satya ane ahimsa sathe vaat karu chu.",
-                "Badha loko no maan ane samman rakhvu mari pehli zimmedari che.",
-                "Prakruti, paani, vruksho ane praniyo prati daya jaruri che.",
-                "Mara jawab shanti, sahkar ane santulan taraf lai jay che.",
-                "Hu ahankar karta vinamrata ane seva pasand karu chu.",
-                "Matbhed hoy to pan karuna sathe samvad thi ukel shodhvo joiye.",
-                "Hu koi ne nuksan thae evu margdarshan aapto nathi.",
-                "Dharati badha ni che, etle ecology ane progress banne jaruri che.",
+            if lang == "hi":
+                hi_roman = [
+                    "Main daya, satya aur ahimsa ke saath baat karta hoon.",
+                    "Har vyakti ka samman zaruri hai, bina bhed-bhav ke.",
+                    "Prakriti, paani, ped aur sabhi jeevon ka sanrakshan mahatvapurn hai.",
+                    "Matbhed ho to samvad aur karuna se hal khojna chahiye.",
+                ]
+                return base_en + (hi_roman if include_romanized else [])
+            if lang == "gu":
+                gu_roman = [
+                    "Hu daya, satya ane ahimsa sathe vaat karu chu.",
+                    "Darek vyakti no maan ane samman rakhvu jaruri che.",
+                    "Prakruti, paani, vruksho ane badha praniyo prati daya jaruri che.",
+                    "Matbhed hoy to samvad ane karuna thi ukel shodhvo joiye.",
+                ]
+                return base_en + (gu_roman if include_romanized else [])
+            return base_en
+
+        def _dataset_candidates(lang: str) -> list[dict[str, str]]:
+            if lang == "en":
+                return [
+                    {
+                        "path": "HuggingFaceFW/fineweb-edu",
+                        "name": "sample-10BT",
+                        "split": "train",
+                        "label": "HuggingFaceFW/fineweb-edu (sample-10BT)",
+                    },
+                    {
+                        "path": "wikimedia/wikipedia",
+                        "name": "20231101.en",
+                        "split": "train",
+                        "label": "wikimedia/wikipedia (20231101.en)",
+                    },
+                    {
+                        "path": "allenai/c4",
+                        "name": "en",
+                        "split": "train",
+                        "label": "allenai/c4 (en)",
+                    },
+                ]
+            if lang == "hi":
+                return [
+                    {
+                        "path": "ai4bharat/sangraha",
+                        "data_dir": "verified/hin",
+                        "split": "hin_Deva",
+                        "label": "ai4bharat/sangraha (verified/hin, hin_Deva)",
+                    },
+                    {
+                        "path": "ai4bharat/sangraha",
+                        "data_dir": "unverified/hin",
+                        "split": "hin_Deva",
+                        "label": "ai4bharat/sangraha (unverified/hin, hin_Deva)",
+                    },
+                    {
+                        "path": "wikimedia/wikipedia",
+                        "name": "20231101.hi",
+                        "split": "train",
+                        "label": "wikimedia/wikipedia (20231101.hi)",
+                    },
+                    {
+                        "path": "mc4",
+                        "name": "hi",
+                        "split": "train",
+                        "label": "mc4 (hi)",
+                    },
+                ]
+            # Gujarati default.
+            return [
+                {
+                    "path": "ai4bharat/sangraha",
+                    "data_dir": "verified/guj",
+                    "split": "guj_Gujr",
+                    "label": "ai4bharat/sangraha (verified/guj, guj_Gujr)",
+                },
+                {
+                    "path": "ai4bharat/sangraha",
+                    "data_dir": "unverified/guj",
+                    "split": "guj_Gujr",
+                    "label": "ai4bharat/sangraha (unverified/guj, guj_Gujr)",
+                },
+                {
+                    "path": "wikimedia/wikipedia",
+                    "name": "20231101.gu",
+                    "split": "train",
+                    "label": "wikimedia/wikipedia (20231101.gu)",
+                },
+                {
+                    "path": "mc4",
+                    "name": "gu",
+                    "split": "train",
+                    "label": "mc4 (gu)",
+                },
             ]
-            return native + roman
 
         def prepare_data(
             data_dir: str,
@@ -253,9 +340,9 @@ except ModuleNotFoundError:
             tok_dir = data_root / "tokenizer"
             tok_dir.mkdir(parents=True, exist_ok=True)
 
-            lang = str(language).strip().lower()
+            lang = _canon_lang(language)
             strict = quality_profile == "strict"
-            bootstrap_version = 2
+            bootstrap_version = 3
             corpus_path = raw_dir_path / f"{lang}_bootstrap.txt"
             sp_prefix = tok_dir / f"aria_{lang}"
             sp_model = sp_prefix.with_suffix(".model")
@@ -288,7 +375,7 @@ except ModuleNotFoundError:
                 if not mismatch:
                     print(f"[OK] Reusing existing processed data: {train_bin}")
                     return str(train_bin)
-                print("[INFO] Existing processed data does not match requested Gujarati setup.")
+                print("[INFO] Existing processed data does not match requested language setup.")
                 print("[INFO] Rebuilding due to: " + "; ".join(mismatch))
 
             def _extract_text(row: dict) -> str:
@@ -313,12 +400,7 @@ except ModuleNotFoundError:
                         "Install with: pip install datasets"
                     ) from exc
 
-                # Gujarati-first high-quality sources.
-                candidates = [
-                    ("wikimedia/wikipedia", f"20231101.{lang}", "train"),
-                    ("wikimedia/wikipedia", f"20220301.{lang}", "train"),
-                    ("mc4", lang, "train"),
-                ]
+                candidates = _dataset_candidates(lang)
                 last_err: Exception | None = None
 
                 seen: set[str] = set()
@@ -329,15 +411,25 @@ except ModuleNotFoundError:
                 successful_sources = 0
 
                 with corpus_path.open("w", encoding="utf-8") as f:
-                    for name, config, split in candidates:
+                    for cand in candidates:
+                        label = cand.get("label", cand.get("path", "unknown"))
                         try:
-                            print(f"[INFO] Downloading corpus from {name} ({config})...")
-                            ds = load_dataset(name, config, split=split, streaming=True)
+                            load_kwargs: dict = {
+                                "path": cand["path"],
+                                "split": cand["split"],
+                                "streaming": True,
+                            }
+                            if "name" in cand:
+                                load_kwargs["name"] = cand["name"]
+                            if "data_dir" in cand:
+                                load_kwargs["data_dir"] = cand["data_dir"]
+                            print(f"[INFO] Downloading corpus from {label}...")
+                            ds = load_dataset(**load_kwargs)
                             before = kept_native
                             for row in ds:
                                 raw = _extract_text(row)
                                 text = _normalize_text(raw)
-                                if not _looks_high_quality_gujarati(text, strict=strict):
+                                if not _looks_high_quality_text(text, lang=lang, strict=strict):
                                     continue
                                 key = text.lower()
                                 if key in seen:
@@ -348,11 +440,11 @@ except ModuleNotFoundError:
                                 kept_native += 1
                                 chars += len(text)
 
-                                if include_romanized and romanized_ratio > 0.0:
+                                if include_romanized and romanized_ratio > 0.0 and lang in {"gu", "hi"}:
                                     if float(rng.random()) < romanized_ratio:
-                                        rom = _to_roman_gujarati(text)
+                                        rom = _to_roman_indic(text, lang=lang)
                                         rom = _normalize_text(rom)
-                                        if _looks_reasonable_romanized(rom):
+                                        if _looks_reasonable_romanized(rom, lang=lang):
                                             f.write(rom + "\n")
                                             kept_roman += 1
                                             chars += len(rom)
@@ -361,8 +453,8 @@ except ModuleNotFoundError:
                                                 and gujlish_ratio > 0.0
                                                 and float(rng.random()) < gujlish_ratio
                                             ):
-                                                mix = _to_gujlish(rom, rng=rng)
-                                                if _looks_reasonable_romanized(mix):
+                                                mix = _to_code_mix(rom, lang=lang, rng=rng)
+                                                if _looks_reasonable_romanized(mix, lang=lang):
                                                     f.write(mix + "\n")
                                                     kept_gujlish += 1
                                                     chars += len(mix)
@@ -373,21 +465,21 @@ except ModuleNotFoundError:
                             if gained > 0:
                                 successful_sources += 1
                             print(
-                                f"[INFO] Source done: {name}:{config} | "
+                                f"[INFO] Source done: {label} | "
                                 f"accepted_native={gained:,} | total_native={kept_native:,}"
                             )
                             if kept_native >= max_docs or chars >= max_chars:
                                 break
                         except Exception as exc:
                             last_err = exc
-                            print(f"[WARN] Failed source {name}:{config} -> {exc}")
+                            print(f"[WARN] Failed source {label} -> {exc}")
 
                 if kept_native == 0:
                     raise RuntimeError("All built-in dataset sources failed or produced zero usable text") from last_err
 
                 if kept_native < int(min_native_docs):
                     raise RuntimeError(
-                        f"Collected only {kept_native:,} native Gujarati lines, below minimum {min_native_docs:,}. "
+                        f"Collected only {kept_native:,} native {lang} lines, below minimum {min_native_docs:,}. "
                         "Increase max_docs/max_chars or use balanced quality profile."
                     )
 
@@ -397,7 +489,7 @@ except ModuleNotFoundError:
                     f"({chars/1e6:.1f}M chars)"
                 )
                 if include_values_pack and values_pack_repeat > 0:
-                    values = _alignment_values_pack(include_romanized=include_romanized)
+                    values = _alignment_values_pack(lang=lang, include_romanized=include_romanized)
                     with corpus_path.open("a", encoding="utf-8") as f:
                         for _ in range(max(1, int(values_pack_repeat))):
                             for line in values:
@@ -492,7 +584,7 @@ def main():
         "--include_romanized",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Include Gujarati text in Roman script alongside native script",
+        help="Include language text in Roman script alongside native script (Indic languages only)",
     )
     parser.add_argument(
         "--romanized_ratio",
@@ -504,7 +596,7 @@ def main():
         "--include_gujlish",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Add Gujarati+English code-mixed Roman lines",
+        help="Add language+English code-mixed Roman lines (Indic languages only)",
     )
     parser.add_argument(
         "--gujlish_ratio",
@@ -543,7 +635,7 @@ def main():
         "--bootstrap_min_native_docs",
         type=int,
         default=30_000,
-        help="Fail bootstrap if accepted native Gujarati lines are below this threshold",
+        help="Fail bootstrap if accepted native-language lines are below this threshold",
     )
     parser.add_argument("--tokenizer_vocab_size", type=int, default=20_000)
 

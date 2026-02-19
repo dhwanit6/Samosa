@@ -28,10 +28,10 @@ def _set_default(flag: str, value: str | None = None) -> None:
 def main() -> None:
     _set_default("--language", "gu")
     _set_default("--output_dir", "checkpoints/eco_hybrid_gu")
-    _set_default("--quality_profile", "strict")
+    _set_default("--quality_profile", "balanced")
     _set_default("--bootstrap_max_docs", "220000")
     _set_default("--bootstrap_max_chars", "120000000")
-    _set_default("--bootstrap_min_native_docs", "60000")
+    _set_default("--bootstrap_min_native_docs", "30000")
     _set_default("--tokenizer_vocab_size", "24000")
     _set_default("--include_romanized")
     _set_default("--romanized_ratio", "0.35")

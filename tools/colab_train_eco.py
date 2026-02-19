@@ -409,6 +409,8 @@ except ModuleNotFoundError:
                 kept_gujlish = 0
                 chars = 0
                 successful_sources = 0
+                soft_char_cap = max(1, int(max_chars))
+                hard_char_cap = max(soft_char_cap, int(round(soft_char_cap * 2.5)))
 
                 with corpus_path.open("w", encoding="utf-8") as f:
                     for cand in candidates:
@@ -459,7 +461,13 @@ except ModuleNotFoundError:
                                                     kept_gujlish += 1
                                                     chars += len(mix)
 
-                                if kept_native >= max_docs or chars >= max_chars:
+                                if kept_native >= max_docs:
+                                    break
+                                # Stop early at soft char cap only after doc-count floor is met.
+                                if chars >= soft_char_cap and kept_native >= int(min_native_docs):
+                                    break
+                                # Hard fail-safe cap so long-document corpora do not run unbounded.
+                                if chars >= hard_char_cap:
                                     break
                             gained = kept_native - before
                             if gained > 0:
@@ -468,7 +476,15 @@ except ModuleNotFoundError:
                                 f"[INFO] Source done: {label} | "
                                 f"accepted_native={gained:,} | total_native={kept_native:,}"
                             )
-                            if kept_native >= max_docs or chars >= max_chars:
+                            if kept_native >= max_docs:
+                                break
+                            if chars >= soft_char_cap and kept_native >= int(min_native_docs):
+                                break
+                            if chars >= hard_char_cap:
+                                print(
+                                    "[WARN] Reached hard char cap before doc-count floor. "
+                                    "Proceeding with collected corpus."
+                                )
                                 break
                         except Exception as exc:
                             last_err = exc
@@ -478,10 +494,17 @@ except ModuleNotFoundError:
                     raise RuntimeError("All built-in dataset sources failed or produced zero usable text") from last_err
 
                 if kept_native < int(min_native_docs):
-                    raise RuntimeError(
-                        f"Collected only {kept_native:,} native {lang} lines, below minimum {min_native_docs:,}. "
-                        "Increase max_docs/max_chars or use balanced quality profile."
-                    )
+                    if chars >= soft_char_cap:
+                        print(
+                            f"[WARN] Collected {kept_native:,} native {lang} lines (<{min_native_docs:,}) "
+                            f"but already reached char budget ({chars/1e6:.1f}M chars). Continuing."
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"Collected only {kept_native:,} native {lang} lines, below minimum {min_native_docs:,}. "
+                            "Increase max_docs/max_chars, lower --bootstrap_min_native_docs, "
+                            "or use --quality_profile balanced."
+                        )
 
                 print(
                     f"[OK] Collected native={kept_native:,}, romanized={kept_roman:,}, "
